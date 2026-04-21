@@ -1,0 +1,912 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>On-Call Scheduler — Corvallis Physician Group</title>
+<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+<style>
+*{box-sizing:border-box;margin:0;padding:0;}
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#f3f4f6;color:#111827;}
+input,select{font-family:inherit;font-size:13px;padding:7px 10px;border:1px solid #d1d5db;border-radius:6px;background:#fff;color:#111827;outline:none;}
+input:focus,select:focus{border-color:#2563eb;box-shadow:0 0 0 3px rgba(37,99,235,0.15);}
+button{font-family:inherit;cursor:pointer;}
+@media print{.no-print{display:none!important;}body{background:#fff;}}
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const {useState,useEffect,useMemo,useCallback}=React;
+
+const DEFAULT_PHYSICIANS=[
+  {id:1,name:"Vanessa McDonald",initials:"VM"},
+  {id:2,name:"Jennifer Olson",initials:"JO"},
+  {id:3,name:"Stephanie Axman",initials:"SA"},
+  {id:4,name:"Joel Mack",initials:"JM"},
+  {id:5,name:"Elizabeth Schmick",initials:"ES"},
+];
+const COLORS=["#1d4ed8","#065f46","#92400e","#831843","#0e7490","#4c1d95","#7c2d12","#0c4a6e","#155e75","#713f12"];
+const LIGHTS=["#dbeafe","#d1fae5","#fef3c7","#fce7f3","#cffafe","#ede9fe","#ffedd5","#e0f2fe","#cffafe","#fef9c3"];
+const MONTHS=["January","February","March","April","May","June","July","August","September","October","November","December"];
+
+function pad2(n){return String(n).padStart(2,"0");}
+function dk(d){return `${d.getFullYear()}-${pad2(d.getMonth()+1)}-${pad2(d.getDate())}`;}
+function fmt(d){return d.toLocaleDateString("en-US",{month:"short",day:"numeric",weekday:"short"});}
+function fmtS(d){return d.toLocaleDateString("en-US",{month:"short",day:"numeric"});}
+function getInitials(n){return n.trim().split(/\s+/).map(w=>w[0].toUpperCase()).join("").slice(0,2);}
+function lsSave(key,val){try{localStorage.setItem("pcs_"+key,JSON.stringify(val));}catch(_){}}
+function lsLoad(key,fb){try{const r=localStorage.getItem("pcs_"+key);return r?JSON.parse(r):fb;}catch(_){return fb;}}
+
+// ── Holiday weekend definitions ────────────────────────────────────────────
+// Returns all weekends that require 2-physician coverage.
+// "alwaysTwo" = true means the weekend itself always uses 2 physicians (Thanksgiving, Christmas, NYE/NYD, July 4th near weekend)
+// "extraDay" = a holiday day adjoined to the weekend (Memorial Day Mon, Labor Day Mon, etc.)
+function getHolidayWeekends(year){
+  const hw=[];
+
+  // Memorial Day — last Monday of May. 2-physician only on the holiday Monday block, regular weekend Sat/Sun is 1-physician.
+  const may31=new Date(year,4,31);
+  const memMon=new Date(year,4,31-((may31.getDay()+6)%7));
+  const memSat=new Date(memMon);memSat.setDate(memMon.getDate()-2);
+  const memSun=new Date(memMon);memSun.setDate(memMon.getDate()-1);
+  hw.push({key:"memorial",label:"Memorial Day Weekend",sat:memSat,sun:memSun,extraDay:memMon,extraDayLabel:"Memorial Day",alwaysTwo:true});
+
+  // Labor Day — first Monday of September
+  const sep1=new Date(year,8,1);
+  const labMon=new Date(year,8,1+((8-sep1.getDay())%7));
+  const labSat=new Date(labMon);labSat.setDate(labMon.getDate()-2);
+  const labSun=new Date(labMon);labSun.setDate(labMon.getDate()-1);
+  hw.push({key:"labor",label:"Labor Day Weekend",sat:labSat,sun:labSun,extraDay:labMon,extraDayLabel:"Labor Day",alwaysTwo:true});
+
+  // Thanksgiving — 4th Thursday of November + Friday. Weekend ALSO gets 2 physicians.
+  const nov1=new Date(year,10,1);
+  const tgiving=new Date(year,10,1+((4-nov1.getDay()+7)%7)+21);
+  const tgivingFri=new Date(year,10,tgiving.getDate()+1);
+  // The following Saturday/Sunday after Thanksgiving
+  const tgivingSat=new Date(year,10,tgiving.getDate()+2);
+  const tgivingSun=new Date(year,10,tgiving.getDate()+3);
+  hw.push({key:"thanksgiving_main",label:"Thanksgiving",sat:tgiving,sun:tgivingFri,extraDay:null,extraDayLabel:null,alwaysTwo:true,isThanksgiving:true});
+  hw.push({key:"thanksgiving_wknd",label:"Thanksgiving Weekend",sat:tgivingSat,sun:tgivingSun,extraDay:null,extraDayLabel:null,alwaysTwo:true});
+
+  // Christmas Eve + Christmas Day (Dec 24-25). Weekend nearest also gets 2 physicians.
+  hw.push({key:"christmas",label:"Christmas",sat:new Date(year,11,24),sun:new Date(year,11,25),extraDay:null,extraDayLabel:null,alwaysTwo:true});
+  // If Dec 26 is a Saturday, cover that weekend too
+  const dec26=new Date(year,11,26);
+  if(dec26.getDay()===6){
+    hw.push({key:"christmas_wknd",label:"Christmas Weekend",sat:dec26,sun:new Date(year,11,27),extraDay:null,extraDayLabel:null,alwaysTwo:true});
+  } else if(dec26.getDay()===0){
+    // Dec 26 is Sunday — the weekend was Dec 24/25 already covered
+  }
+
+  // New Year's Eve + New Year's Day
+  hw.push({key:"newyear",label:"New Year's",sat:new Date(year,11,31),sun:new Date(year+1,0,1),extraDay:null,extraDayLabel:null,alwaysTwo:true});
+
+  // July 4th — if on Friday or Monday, cover that extended weekend with 2 physicians
+  const jul4=new Date(year,6,4);
+  if(jul4.getDay()===5){
+    hw.push({key:"jul4",label:"July 4th Weekend",sat:new Date(year,6,5),sun:new Date(year,6,6),extraDay:jul4,extraDayLabel:"Independence Day (Fri)",alwaysTwo:true});
+  } else if(jul4.getDay()===1){
+    hw.push({key:"jul4",label:"July 4th Weekend",sat:new Date(year,6,2),sun:new Date(year,6,3),extraDay:jul4,extraDayLabel:"Independence Day (Mon)",alwaysTwo:true});
+  } else if(jul4.getDay()===6){
+    // July 4 IS the Saturday
+    hw.push({key:"jul4",label:"July 4th Weekend",sat:jul4,sun:new Date(year,6,5),extraDay:null,extraDayLabel:null,alwaysTwo:true});
+  } else if(jul4.getDay()===0){
+    // July 4 IS the Sunday
+    hw.push({key:"jul4",label:"July 4th Weekend",sat:new Date(year,6,3),sun:jul4,extraDay:null,extraDayLabel:null,alwaysTwo:true});
+  }
+
+  return hw;
+}
+
+function getRegularWeekends(year,hwList){
+  const hwKeys=new Set(hwList.map(h=>dk(h.sat)));
+  const ws=[];let d=new Date(year,0,1);
+  while(d.getFullYear()===year){
+    if(d.getDay()===6&&!hwKeys.has(dk(d))){
+      const sat=new Date(d),sun=new Date(d);sun.setDate(sun.getDate()+1);
+      ws.push({sat,sun,n:ws.length+1});
+    }
+    d.setDate(d.getDate()+1);
+  }
+  return ws;
+}
+
+function generateSchedule(year,profiles,phys){
+  const hwList=getHolidayWeekends(year),regList=getRegularWeekends(year,hwList);
+  const sched={},counts={},lastSat={};
+  phys.forEach(p=>{counts[p.id]=0;});
+  const blocked={};
+  phys.forEach(p=>{(profiles[p.id]?.blockedDates||[]).forEach(k=>{if(!blocked[k])blocked[k]=new Set();blocked[k].add(p.id);});});
+  const noC={};phys.forEach(p=>{noC[p.id]=profiles[p.id]?.consecutiveOk===false;});
+
+  function pick(satKey,ex=[]){
+    const av=phys.filter(p=>{
+      if(ex.includes(p.id))return false;
+      if(blocked[satKey]?.has(p.id))return false;
+      if(noC[p.id]){const pv=new Date(satKey);pv.setDate(pv.getDate()-7);if(lastSat[p.id]===dk(pv))return false;}
+      return true;
+    });
+    const pool=av.length?av:phys.filter(p=>!ex.includes(p.id)&&!blocked[satKey]?.has(p.id));
+    if(!pool.length)return null;
+    pool.sort((a,b)=>counts[a.id]-counts[b.id]);return pool[0];
+  }
+
+  // Regular weekends: 1 physician (can be upgraded to 2 manually)
+  regList.forEach(({sat,sun})=>{
+    const satK=dk(sat),p=pick(satK);if(!p)return;
+    sched[satK]={type:"regular",satKey:satK,sunKey:dk(sun),physicianId:p.id,physician2Id:null,twoPhysicians:false};
+    counts[p.id]++;lastSat[p.id]=satK;
+  });
+
+  // Holiday weekends: always 2 physicians
+  hwList.forEach(hw=>{
+    const satK=dk(hw.sat),p1=pick(satK);if(!p1)return;
+    const p2=pick(satK,[p1.id]);
+    sched[satK]={type:"holiday",label:hw.label,satKey:satK,sunKey:dk(hw.sun),extraDay:hw.extraDay?dk(hw.extraDay):null,extraDayLabel:hw.extraDayLabel||null,physician1Id:p1.id,physician2Id:p2?.id||null};
+    counts[p1.id]++;lastSat[p1.id]=satK;
+    if(p2){counts[p2.id]++;lastSat[p2.id]=satK;}
+  });
+  return sched;
+}
+
+// ── Event builder for exports/calendar ────────────────────────────────────
+function buildEvents(sched,phys){
+  const evs=[],getPh=id=>phys.find(p=>p.id===id);
+  Object.entries(sched).forEach(([satK,slot])=>{
+    if(!slot)return;
+    const sat=new Date(satK);
+    if(slot.type==="regular"){
+      const sun=new Date(slot.sunKey);
+      const addPh=(ph,night)=>{
+        if(!ph)return;
+        evs.push({date:sat,dateStr:satK,label:"Sat Day",time:"8:00 AM - 5:00 PM",physician:ph.name,type:"regular",shift:"sat_day"});
+        if(night)evs.push({date:sat,dateStr:satK,label:"Sat Night",time:"5:00 PM - Sun 8:00 AM",physician:ph.name,type:"regular",shift:"sat_night"});
+        evs.push({date:sun,dateStr:slot.sunKey,label:"Sun Day",time:"8:00 AM - 5:00 PM",physician:ph.name,type:"regular",shift:"sun_day"});
+      };
+      const p1=getPh(slot.physicianId),p2=getPh(slot.physician2Id);
+      if(slot.twoPhysicians&&p1&&p2){
+        addPh(p1,true);// p1 covers sat night
+        // p2 covers all day shifts + sun night
+        evs.push({date:sat,dateStr:satK,label:"Sat Day",time:"8:00 AM - 5:00 PM",physician:p2.name,type:"regular",shift:"sat_day"});
+        evs.push({date:sun,dateStr:slot.sunKey,label:"Sun Day",time:"8:00 AM - 5:00 PM",physician:p2.name,type:"regular",shift:"sun_day"});
+        evs.push({date:sun,dateStr:slot.sunKey,label:"Sun Night",time:"5:00 PM - Mon 8:00 AM",physician:p2.name,type:"regular",shift:"sun_night"});
+      } else if(p1){
+        addPh(p1,true);
+      }
+    }
+    if(slot.type==="holiday"){
+      const sun=new Date(slot.sunKey);
+      const hl=slot.label||"Holiday";
+      const p1=getPh(slot.physician1Id),p2=getPh(slot.physician2Id);
+      if(p1){
+        evs.push({date:sat,dateStr:satK,label:hl+" Sat Day",time:"8:00 AM - 5:00 PM",physician:p1.name,type:"holiday",shift:"sat_day"});
+        evs.push({date:sat,dateStr:satK,label:hl+" Sat Night",time:"5:00 PM - Sun 8:00 AM",physician:p1.name,type:"holiday",shift:"sat_night"});
+        evs.push({date:sun,dateStr:slot.sunKey,label:hl+" Sun Day",time:"8:00 AM - 5:00 PM",physician:p1.name,type:"holiday",shift:"sun_day"});
+        if(slot.extraDay)evs.push({date:new Date(slot.extraDay),dateStr:slot.extraDay,label:slot.extraDayLabel,time:"8:00 AM - 5:00 PM",physician:p1.name,type:"holiday",shift:"extra_day"});
+      }
+      if(p2){
+        evs.push({date:sat,dateStr:satK,label:hl+" Sat Day",time:"8:00 AM - 5:00 PM",physician:p2.name,type:"holiday",shift:"sat_day"});
+        evs.push({date:sun,dateStr:slot.sunKey,label:hl+" Sun Day",time:"8:00 AM - 5:00 PM",physician:p2.name,type:"holiday",shift:"sun_day"});
+        evs.push({date:sun,dateStr:slot.sunKey,label:hl+" Sun Night",time:"5:00 PM - Mon 8:00 AM",physician:p2.name,type:"holiday",shift:"sun_night"});
+        if(slot.extraDay)evs.push({date:new Date(slot.extraDay),dateStr:slot.extraDay,label:slot.extraDayLabel,time:"8:00 AM - 5:00 PM",physician:p2.name,type:"holiday",shift:"extra_day"});
+      }
+    }
+  });
+  evs.sort((a,b)=>a.date-b.date);return evs;
+}
+
+// ── Download helpers ───────────────────────────────────────────────────────
+function downloadBlob(content,filename,type){
+  const blob=new Blob([content],{type});
+  const a=document.createElement("a");a.href=URL.createObjectURL(blob);a.download=filename;
+  document.body.appendChild(a);a.click();document.body.removeChild(a);URL.revokeObjectURL(a.href);
+}
+
+function buildICS(evs,filterPhysician){
+  const filtered=filterPhysician?evs.filter(e=>e.physician===filterPhysician):evs;
+  function idt(d,t){let[tp,ap]=t.split(" ");let[h,m]=tp.split(":").map(Number);if(ap==="PM"&&h!==12)h+=12;if(ap==="AM"&&h===12)h=0;return `${d.getFullYear()}${pad2(d.getMonth()+1)}${pad2(d.getDate())}T${pad2(h)}${pad2(m)}00`;}
+  const lines=["BEGIN:VCALENDAR","VERSION:2.0","PRODID:-//PhysicianCallScheduler//EN","CALSCALE:GREGORIAN","METHOD:PUBLISH"];
+  filtered.forEach(ev=>{
+    const st=ev.time.split(" - ")[0];let ed=new Date(ev.date),et;
+    if(ev.shift==="sat_night"||ev.shift==="sun_night"){ed.setDate(ed.getDate()+1);et="8:00 AM";}else et="5:00 PM";
+    lines.push("BEGIN:VEVENT",`UID:pcs-${dk(ev.date)}-${ev.shift}-${ev.physician.replace(/\s/g,"")}@callgroup`,`DTSTART:${idt(ev.date,st)}`,`DTEND:${idt(ed,et)}`,`SUMMARY:On-Call: ${ev.label} - Dr. ${ev.physician}`,`DESCRIPTION:Dr. ${ev.physician}\\n${ev.time}`,"LOCATION:Corvallis\\, OR","END:VEVENT");
+  });
+  lines.push("END:VCALENDAR");return lines.join("\r\n");
+}
+
+// ── Export functions ───────────────────────────────────────────────────────
+function exportExcel(sched,phys,year){
+  const evs=buildEvents(sched,phys);
+  const WB=XLSX.utils.book_new();
+  const rows=[["Date","Day of Week","Shift","Time","Physician","Type"]];
+  evs.forEach(ev=>rows.push([ev.date.toLocaleDateString(),ev.date.toLocaleDateString("en-US",{weekday:"long"}),ev.label,ev.time,ev.physician,ev.type==="holiday"?"Holiday":"Regular"]));
+  const ws=XLSX.utils.aoa_to_sheet(rows);ws["!cols"]=[{wch:14},{wch:14},{wch:30},{wch:24},{wch:22},{wch:10}];
+  XLSX.utils.book_append_sheet(WB,ws,"Full Schedule");
+  phys.forEach(ph=>{
+    const r=[["Date","Shift","Time","Type"]];
+    evs.filter(e=>e.physician===ph.name).forEach(ev=>r.push([ev.date.toLocaleDateString(),ev.label,ev.time,ev.type==="holiday"?"Holiday":"Regular"]));
+    const ws2=XLSX.utils.aoa_to_sheet(r);ws2["!cols"]=[{wch:14},{wch:30},{wch:24},{wch:10}];
+    XLSX.utils.book_append_sheet(WB,ws2,ph.name.split(" ").pop());
+  });
+  const sumRows=[["Physician",...MONTHS.map(m=>m.slice(0,3)),"Total"]];
+  phys.forEach(ph=>{
+    const mc=Array(12).fill(0);
+    evs.filter(e=>e.physician===ph.name&&e.shift!=="sat_night"&&e.shift!=="sun_night"&&e.date.getFullYear()===year).forEach(ev=>{mc[ev.date.getMonth()]++;});
+    sumRows.push([ph.name,...mc,mc.reduce((a,b)=>a+b,0)]);
+  });
+  const ws3=XLSX.utils.aoa_to_sheet(sumRows);
+  XLSX.utils.book_append_sheet(WB,ws3,"Monthly Summary");
+  XLSX.writeFile(WB,`OnCall_Schedule_${year}.xlsx`);
+}
+
+function exportNumbers(sched,phys,year){
+  // Numbers uses CSV; user imports via File > Import
+  const evs=buildEvents(sched,phys);
+  const rows=[["Date","Day of Week","Shift","Time","Physician","Type"]];
+  evs.forEach(ev=>rows.push([ev.date.toLocaleDateString("en-US"),ev.date.toLocaleDateString("en-US",{weekday:"long"}),ev.label,ev.time,`Dr. ${ev.physician}`,ev.type==="holiday"?"Holiday":"Regular"]));
+  const csv=rows.map(r=>r.map(c=>`"${String(c).replace(/"/g,'""')}"`).join(",")).join("\n");
+  downloadBlob(csv,`OnCall_Schedule_${year}_Numbers.csv`,"text/csv;charset=utf-8");
+}
+
+function exportGoogleSheets(sched,phys,year){
+  // Google Sheets imports CSV natively
+  const evs=buildEvents(sched,phys);
+  const rows=[["Date","Day","Shift","Time","Physician","Type"]];
+  evs.forEach(ev=>rows.push([ev.date.toLocaleDateString("en-US"),ev.date.toLocaleDateString("en-US",{weekday:"long"}),ev.label,ev.time,`Dr. ${ev.physician}`,ev.type==="holiday"?"Holiday":"Regular"]));
+  const csv=rows.map(r=>r.map(c=>`"${String(c).replace(/"/g,'""')}"`).join(",")).join("\n");
+  downloadBlob(csv,`OnCall_Schedule_${year}_GoogleSheets.csv`,"text/csv;charset=utf-8");
+}
+
+function buildWordHtml(sched,phys,year){
+  const evs=buildEvents(sched,phys);
+  const grouped={};
+  evs.filter(e=>e.shift!=="sat_night"&&e.shift!=="sun_night").forEach(ev=>{const m=ev.date.getMonth();if(!grouped[m])grouped[m]=[];grouped[m].push(ev);});
+  let h=`<html><head><meta charset='utf-8'><style>body{font-family:Arial,sans-serif;font-size:11pt;margin:1in;}h1{color:#1d4ed8;font-size:16pt;}h2{color:#1d4ed8;font-size:12pt;border-bottom:1pt solid #1d4ed8;margin-top:14pt;}table{width:100%;border-collapse:collapse;margin-bottom:10pt;}th{background:#1d4ed8;color:#fff;padding:4pt 8pt;font-size:10pt;text-align:left;}td{padding:4pt 8pt;font-size:10pt;border-bottom:0.5pt solid #e5e7eb;}tr:nth-child(even)td{background:#eff6ff;}.hol td{background:#fef9c3!important;font-weight:bold;}</style></head><body>`;
+  h+=`<h1>On-Call Schedule — ${year}</h1><p style="color:#6b7280;font-size:10pt;margin-bottom:12pt;">Corvallis Physician Call Group · Generated ${new Date().toLocaleDateString("en-US",{month:"long",day:"numeric",year:"numeric"})}</p>`;
+  for(let m=0;m<12;m++){
+    if(!grouped[m]?.length)continue;
+    h+=`<h2>${MONTHS[m]} ${year}</h2><table><tr><th>Date</th><th>Day</th><th>Shift</th><th>Time</th><th>Physician</th></tr>`;
+    grouped[m].forEach(ev=>{h+=`<tr${ev.type==="holiday"?" class='hol'":""}><td>${fmtS(ev.date)}</td><td>${ev.date.toLocaleDateString("en-US",{weekday:"long"})}</td><td>${ev.label}</td><td>${ev.time}</td><td>Dr. ${ev.physician}</td></tr>`;});
+    h+=`</table>`;
+  }
+  h+=`<h1 style="page-break-before:always;">Individual Physician Schedules</h1>`;
+  phys.forEach(ph=>{
+    const phEvs=evs.filter(e=>e.physician===ph.name&&e.shift!=="sat_night"&&e.shift!=="sun_night");
+    h+=`<h2>Dr. ${ph.name}</h2><table><tr><th>Date</th><th>Shift</th><th>Time</th><th>Type</th></tr>`;
+    phEvs.forEach(ev=>{h+=`<tr${ev.type==="holiday"?" class='hol'":""}><td>${ev.date.toLocaleDateString("en-US",{month:"short",day:"numeric",weekday:"short"})}</td><td>${ev.label}</td><td>${ev.time}</td><td>${ev.type==="holiday"?"Holiday":"Regular"}</td></tr>`;});
+    h+=`</table>`;
+  });
+  h+=`</body></html>`;
+  return h;
+}
+
+function exportWord(sched,phys,year){
+  downloadBlob('\ufeff'+buildWordHtml(sched,phys,year),`OnCall_Schedule_${year}.doc`,"application/msword");
+}
+
+function exportGoogleDocs(sched,phys,year){
+  // Google Docs opens .html files; user can also paste HTML
+  downloadBlob(buildWordHtml(sched,phys,year),`OnCall_Schedule_${year}_GoogleDocs.html`,"text/html;charset=utf-8");
+}
+
+function exportPages(sched,phys,year){
+  // Pages on Mac opens .rtf files. We build a simple RTF.
+  const evs=buildEvents(sched,phys);
+  const grouped={};
+  evs.filter(e=>e.shift!=="sat_night"&&e.shift!=="sun_night").forEach(ev=>{const m=ev.date.getMonth();if(!grouped[m])grouped[m]=[];grouped[m].push(ev);});
+  let rtf=`{\\rtf1\\ansi\\deff0{\\fonttbl{\\f0 Arial;}}{\\colortbl;\\red29\\green78\\blue216;}\\f0\\fs22 `;
+  rtf+=`{\\b\\fs32\\cf1 On-Call Schedule ${year}}\\par\\par `;
+  for(let m=0;m<12;m++){
+    if(!grouped[m]?.length)continue;
+    rtf+=`{\\b\\fs26\\cf1 ${MONTHS[m]} ${year}}\\par `;
+    grouped[m].forEach(ev=>{rtf+=`${fmtS(ev.date)} | ${ev.label} | ${ev.time} | Dr. ${ev.physician}\\par `;});
+    rtf+=`\\par `;
+  }
+  rtf+=`}`;
+  downloadBlob(rtf,`OnCall_Schedule_${year}.rtf`,"application/rtf");
+}
+
+// ── UI Components ──────────────────────────────────────────────────────────
+function Av({ini,size=28,ci=0}){
+  return <div style={{width:size,height:size,borderRadius:"50%",background:LIGHTS[ci%COLORS.length],border:`2px solid ${COLORS[ci%COLORS.length]}`,display:"flex",alignItems:"center",justifyContent:"center",fontSize:size*.33,fontWeight:700,color:COLORS[ci%COLORS.length],flexShrink:0}}>{ini}</div>;
+}
+function Card({children,style={}}){return <div style={{background:"#fff",border:"1px solid #e5e7eb",borderRadius:10,padding:"14px 16px",...style}}>{children}</div>;}
+function Btn({children,onClick,color=COLORS[0],disabled=false,style={}}){
+  return <button onClick={onClick} disabled={disabled} style={{padding:"9px 18px",background:disabled?"#9ca3af":color,color:"#fff",border:"none",borderRadius:7,fontFamily:"inherit",fontSize:13,fontWeight:600,opacity:disabled?.7:1,...style}}>{children}</button>;
+}
+
+// ── SCHEDULE TAB ───────────────────────────────────────────────────────────
+function ScheduleTab({year,sched,setSched,profiles,phys}){
+  const [fm,setFm]=useState(-1),[busy,setBusy]=useState(false),[toast,setToast]=useState("");
+  const hwList=useMemo(()=>getHolidayWeekends(year),[year]);
+  const regList=useMemo(()=>getRegularWeekends(year,hwList),[year,hwList]);
+
+  function doGen(){
+    setBusy(true);
+    setTimeout(()=>{const s=generateSchedule(year,profiles,phys);setSched(s);lsSave("sched_"+year,s);setBusy(false);setToast("Schedule generated!");setTimeout(()=>setToast(""),3000);},400);
+  }
+  function getPh(id){return phys.find(p=>p.id===id);}
+  function getI(id){return phys.findIndex(p=>p.id===id);}
+  function updateSlot(satK,changes){
+    const u={...sched,[satK]:{...sched[satK],...changes}};setSched(u);lsSave("sched_"+year,u);
+  }
+
+  const all=useMemo(()=>{
+    const it=[];
+    regList.forEach(w=>it.push({...w,isH:false}));
+    hwList.forEach(h=>it.push({sat:h.sat,sun:h.sun,label:h.label,extraDay:h.extraDay,extraDayLabel:h.extraDayLabel,isH:true}));
+    it.sort((a,b)=>a.sat-b.sat);return it;
+  },[regList,hwList]);
+  const shown=fm===-1?all:all.filter(w=>w.sat.getMonth()===fm);
+
+  return <div>
+    <div style={{display:"flex",gap:10,flexWrap:"wrap",alignItems:"center",marginBottom:16}}>
+      <Btn onClick={doGen} disabled={busy}>{busy?"Generating...":"Auto-Generate Schedule"}</Btn>
+      <select value={fm} onChange={e=>setFm(parseInt(e.target.value))}>
+        <option value={-1}>All Months</option>
+        {MONTHS.map((m,i)=><option key={i} value={i}>{m}</option>)}
+      </select>
+      {toast&&<span style={{color:COLORS[1],fontWeight:700,fontSize:13}}>{toast}</span>}
+    </div>
+    <div style={{display:"flex",flexDirection:"column",gap:10}}>
+      {shown.map(w=>{
+        const satK=dk(w.sat),slot=sched[satK];
+        if(!w.isH){
+          // Regular weekend — 1 physician default, option to add 2nd
+          const p1=slot?.physicianId?getPh(slot.physicianId):null;
+          const p2=slot?.twoPhysicians&&slot?.physician2Id?getPh(slot.physician2Id):null;
+          const i1=p1?getI(p1.id):-1,i2=p2?getI(p2.id):-1;
+          const isTwoPh=slot?.twoPhysicians===true;
+          return <Card key={satK}>
+            <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:10,flexWrap:"wrap"}}>
+              <span style={{background:LIGHTS[0],color:COLORS[0],fontSize:11,fontWeight:700,padding:"2px 10px",borderRadius:20}}>Regular Weekend</span>
+              <span style={{fontSize:14,fontWeight:700}}>{fmt(w.sat)} — {fmt(w.sun)}</span>
+              <button onClick={()=>updateSlot(satK,{twoPhysicians:!isTwoPh,physician2Id:null})}
+                style={{marginLeft:"auto",padding:"4px 12px",borderRadius:20,border:`1.5px solid ${isTwoPh?"#dc2626":COLORS[1]}`,background:isTwoPh?"#fee2e2":"#d1fae5",color:isTwoPh?"#dc2626":COLORS[1],fontFamily:"inherit",fontSize:11,fontWeight:700,cursor:"pointer"}}>
+                {isTwoPh?"Remove 2nd Physician":"+ Add 2nd Physician"}
+              </button>
+            </div>
+            <div style={{display:"grid",gridTemplateColumns:isTwoPh?"1fr 1fr":"auto",gap:12}}>
+              {/* Physician 1 */}
+              <div style={{padding:"10px 12px",background:p1?LIGHTS[i1]:"#f9fafb",borderRadius:8,border:`1px solid ${p1?COLORS[i1]:"#e5e7eb"}`}}>
+                <div style={{fontSize:11,fontWeight:700,color:"#6b7280",marginBottom:6}}>{isTwoPh?"Physician 1 — Sat Night":"Assigned Physician — all 3 shifts"}</div>
+                <select value={slot?.physicianId||""} onChange={e=>updateSlot(satK,{physicianId:e.target.value?parseInt(e.target.value):null})} style={{width:"100%",marginBottom:8}}>
+                  <option value="">— Unassigned —</option>
+                  {phys.map(p=><option key={p.id} value={p.id}>{p.name}</option>)}
+                </select>
+                {p1&&<div style={{display:"flex",alignItems:"center",gap:7,marginBottom:6}}><Av ini={p1.initials} size={22} ci={i1}/><span style={{fontSize:13,fontWeight:700,color:COLORS[i1]}}>{p1.name}</span></div>}
+                <div style={{display:"flex",gap:5,flexWrap:"wrap"}}>
+                  <span style={{fontSize:10,padding:"2px 7px",borderRadius:20,background:LIGHTS[Math.max(0,i1)],color:COLORS[Math.max(0,i1)],border:`1px solid ${COLORS[Math.max(0,i1)]}`}}>☀ Sat Day 8am–5pm</span>
+                  <span style={{fontSize:10,padding:"2px 7px",borderRadius:20,background:LIGHTS[Math.max(0,i1)],color:COLORS[Math.max(0,i1)],border:`1px solid ${COLORS[Math.max(0,i1)]}`,fontWeight:700}}>🌙 Sat Night 5pm–8am</span>
+                  <span style={{fontSize:10,padding:"2px 7px",borderRadius:20,background:LIGHTS[Math.max(0,i1)],color:COLORS[Math.max(0,i1)],border:`1px solid ${COLORS[Math.max(0,i1)]}`}}>☀ Sun Day 8am–5pm</span>
+                  {isTwoPh&&<span style={{fontSize:10,padding:"2px 7px",borderRadius:20,background:LIGHTS[Math.max(0,i1)],color:COLORS[Math.max(0,i1)],border:`1px solid ${COLORS[Math.max(0,i1)]}`,opacity:.6}}>☀ Sun Day (shared)</span>}
+                </div>
+              </div>
+              {/* Physician 2 — only shown when twoPhysicians */}
+              {isTwoPh&&<div style={{padding:"10px 12px",background:p2?LIGHTS[i2]:"#f9fafb",borderRadius:8,border:`1px solid ${p2?COLORS[i2]:"#e5e7eb"}`}}>
+                <div style={{fontSize:11,fontWeight:700,color:"#6b7280",marginBottom:6}}>Physician 2 — Sun Night</div>
+                <select value={slot?.physician2Id||""} onChange={e=>updateSlot(satK,{physician2Id:e.target.value?parseInt(e.target.value):null})} style={{width:"100%",marginBottom:8}}>
+                  <option value="">— Unassigned —</option>
+                  {phys.map(p=><option key={p.id} value={p.id}>{p.name}</option>)}
+                </select>
+                {p2&&<div style={{display:"flex",alignItems:"center",gap:7,marginBottom:6}}><Av ini={p2.initials} size={22} ci={i2}/><span style={{fontSize:13,fontWeight:700,color:COLORS[i2]}}>{p2.name}</span></div>}
+                <div style={{display:"flex",gap:5,flexWrap:"wrap"}}>
+                  <span style={{fontSize:10,padding:"2px 7px",borderRadius:20,background:LIGHTS[Math.max(0,i2)],color:COLORS[Math.max(0,i2)],border:`1px solid ${COLORS[Math.max(0,i2)]}`,opacity:.6}}>☀ Sat Day (shared)</span>
+                  <span style={{fontSize:10,padding:"2px 7px",borderRadius:20,background:LIGHTS[Math.max(0,i2)],color:COLORS[Math.max(0,i2)],border:`1px solid ${COLORS[Math.max(0,i2)]}`}}>☀ Sun Day 8am–5pm</span>
+                  <span style={{fontSize:10,padding:"2px 7px",borderRadius:20,background:LIGHTS[Math.max(0,i2)],color:COLORS[Math.max(0,i2)],border:`1px solid ${COLORS[Math.max(0,i2)]}`,fontWeight:700}}>🌙 Sun Night 5pm–8am</span>
+                </div>
+              </div>}
+            </div>
+          </Card>;
+        }
+        // Holiday weekend — always 2 physicians
+        const p1=slot?.physician1Id?getPh(slot.physician1Id):null;
+        const p2=slot?.physician2Id?getPh(slot.physician2Id):null;
+        const i1=p1?getI(p1.id):-1,i2=p2?getI(p2.id):-1;
+        return <Card key={satK} style={{border:"2px solid #d97706",background:"#fffbeb"}}>
+          <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:12,flexWrap:"wrap"}}>
+            <span style={{background:"#fef3c7",color:"#92400e",fontSize:11,fontWeight:700,padding:"2px 10px",borderRadius:20}}>Holiday Weekend — 2 Physicians</span>
+            <span style={{fontSize:14,fontWeight:700}}>{w.label}</span>
+            <span style={{fontSize:12,color:"#6b7280"}}>{fmt(w.sat)}{w.extraDay?` – ${fmt(w.extraDay)}`:`– ${fmt(w.sun)}`}</span>
+          </div>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12}}>
+            {[{ph:p1,ci:i1,field:"physician1Id",label:"Physician 1 — covers Sat Night"},{ph:p2,ci:i2,field:"physician2Id",label:"Physician 2 — covers Sun Night"}].map(({ph,ci,field,label})=>(
+              <div key={field} style={{padding:"10px 12px",background:ph?LIGHTS[ci]:"#f9fafb",borderRadius:8,border:`1px solid ${ph?COLORS[ci]:"#e5e7eb"}`}}>
+                <div style={{fontSize:11,fontWeight:700,color:"#6b7280",marginBottom:6}}>{label}</div>
+                <select value={slot?.[field]||""} onChange={e=>updateSlot(satK,{[field]:e.target.value?parseInt(e.target.value):null})} style={{width:"100%",marginBottom:8}}>
+                  <option value="">— Unassigned —</option>
+                  {phys.map(p=><option key={p.id} value={p.id}>{p.name}</option>)}
+                </select>
+                {ph&&<div style={{display:"flex",alignItems:"center",gap:7,marginBottom:6}}><Av ini={ph.initials} size={20} ci={ci}/><span style={{fontSize:12,fontWeight:700,color:COLORS[ci]}}>{ph.name}</span></div>}
+                <div style={{fontSize:10,color:"#374151",lineHeight:2.1}}>
+                  <div>☀ {fmtS(w.sat)} Day 8am–5pm</div>
+                  {field==="physician1Id"&&<div style={{fontWeight:700,color:ph?COLORS[ci]:"#9ca3af"}}>🌙 {fmtS(w.sat)} Night 5pm–8am</div>}
+                  <div>☀ {fmtS(w.sun)} Day 8am–5pm</div>
+                  {field==="physician2Id"&&<div style={{fontWeight:700,color:ph?COLORS[ci]:"#9ca3af"}}>🌙 {fmtS(w.sun)} Night 5pm–8am</div>}
+                  {w.extraDay&&<div>☀ {fmtS(w.extraDay)} Day until 5pm</div>}
+                </div>
+              </div>
+            ))}
+          </div>
+        </Card>;
+      })}
+    </div>
+  </div>;
+}
+
+// ── CALENDAR TAB ───────────────────────────────────────────────────────────
+function CalendarTab({sched,phys,year}){
+  const [vm,setVm]=useState(new Date().getMonth()),[fp,setFp]=useState(0);
+  const evs=useMemo(()=>buildEvents(sched,phys),[sched,phys]);
+  const first=new Date(year,vm,1),last=new Date(year,vm+1,0),sdow=first.getDay();
+  const total=Math.ceil((sdow+last.getDate())/7)*7;
+  const cells=[];
+  for(let i=0;i<total;i++){
+    const dn=i-sdow+1;
+    if(dn<1||dn>last.getDate()){cells.push(null);continue;}
+    const d=new Date(year,vm,dn),dKey=dk(d);
+    const dayEvs=evs.filter(e=>e.dateStr===dKey&&(fp===0||phys.find(p=>p.id===fp)?.name===e.physician));
+    cells.push({dn,d,dKey,evs:dayEvs});
+  }
+  const phC={},phB={};phys.forEach((p,i)=>{phC[p.name]=COLORS[i%COLORS.length];phB[p.name]=LIGHTS[i%LIGHTS.length];});
+  return <div>
+    <div className="no-print" style={{display:"flex",gap:8,flexWrap:"wrap",alignItems:"center",marginBottom:14}}>
+      <Btn onClick={()=>setVm(m=>Math.max(0,m-1))} color="#374151">◀ Prev</Btn>
+      <select value={vm} onChange={e=>setVm(parseInt(e.target.value))}>
+        {MONTHS.map((m,i)=><option key={i} value={i}>{m} {year}</option>)}
+      </select>
+      <Btn onClick={()=>setVm(m=>Math.min(11,m+1))} color="#374151">Next ▶</Btn>
+      <select value={fp} onChange={e=>setFp(parseInt(e.target.value))}>
+        <option value={0}>All Physicians</option>
+        {phys.map(p=><option key={p.id} value={p.id}>{p.name}</option>)}
+      </select>
+      <Btn onClick={()=>window.print()} color="#4b5563" style={{marginLeft:"auto"}}>🖨 Print Calendar</Btn>
+    </div>
+    <div style={{textAlign:"center",fontSize:18,fontWeight:800,marginBottom:12,color:COLORS[0]}}>{MONTHS[vm]} {year}{fp?` — Dr. ${phys.find(p=>p.id===fp)?.name}`:""}</div>
+    <div style={{display:"grid",gridTemplateColumns:"repeat(7,1fr)",background:"#e5e7eb",gap:1,border:"1px solid #e5e7eb",borderRadius:8,overflow:"hidden"}}>
+      {["Sunday","Monday","Tuesday","Wednesday","Thursday","Friday","Saturday"].map(d=>(
+        <div key={d} style={{textAlign:"center",fontSize:11,fontWeight:700,color:"#374151",padding:"6px 0",background:"#f3f4f6"}}>{d}</div>
+      ))}
+      {cells.map((cell,i)=>{
+        if(!cell)return <div key={i} style={{minHeight:90,background:"#fafafa"}}/>;
+        const wknd=cell.d.getDay()===0||cell.d.getDay()===6;
+        return <div key={i} style={{minHeight:90,background:cell.evs.length?(wknd?"#eff6ff":"#f8faff"):"#fff",padding:"5px"}}>
+          <div style={{fontSize:13,fontWeight:700,color:wknd?COLORS[0]:"#6b7280",marginBottom:3}}>{cell.dn}</div>
+          {cell.evs.map((ev,j)=>{
+            const pLast=ev.physician.split(" ").pop();
+            const short=ev.shift==="sat_night"||ev.shift==="sun_night"?"Night":"Day";
+            return <div key={j} title={`Dr. ${ev.physician} — ${ev.label} ${ev.time}`}
+              style={{fontSize:9,background:phB[ev.physician],color:phC[ev.physician],border:`1px solid ${phC[ev.physician]}`,borderRadius:4,padding:"2px 4px",marginBottom:2,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap",fontWeight:700}}>
+              {ev.type==="holiday"?"★ ":""}{short} {pLast}
+            </div>;
+          })}
+        </div>;
+      })}
+    </div>
+    <div style={{marginTop:14,display:"flex",gap:12,flexWrap:"wrap",alignItems:"center"}}>
+      {phys.map((p,i)=>(
+        <div key={p.id} style={{display:"flex",alignItems:"center",gap:5,fontSize:12}}>
+          <div style={{width:12,height:12,borderRadius:3,background:LIGHTS[i%LIGHTS.length],border:`1.5px solid ${COLORS[i%COLORS.length]}`}}/>
+          <span style={{color:COLORS[i%COLORS.length],fontWeight:600}}>{p.name}</span>
+        </div>
+      ))}
+      <span style={{fontSize:12,color:"#6b7280"}}>★ = Holiday weekend</span>
+    </div>
+  </div>;
+}
+
+// ── EXPORT & SYNC TAB ──────────────────────────────────────────────────────
+function ExportTab({sched,phys,year}){
+  const [icalPh,setIP]=useState("all"),[calPh,setCP]=useState(phys[0]?.id||1),[msg,setMsg]=useState("");
+  const evs=useMemo(()=>buildEvents(sched,phys),[sched,phys]);
+
+  function doExport(fn,filename,label){
+    try{fn();setMsg(`${label} downloaded to your Downloads folder!`);}
+    catch(e){setMsg("Error: "+e.message);}
+  }
+
+  function doICS(){
+    const filterName=icalPh==="all"?null:phys.find(p=>p.id==icalPh)?.name;
+    const ics=buildICS(evs,filterName);
+    const suffix=filterName?filterName.split(" ").pop():"AllPhysicians";
+    downloadBlob(ics,`OnCall_${suffix}_${year}.ics`,"text/calendar;charset=utf-8");
+    setMsg("iCal file downloaded! Import into Google Calendar, Apple Calendar, or Outlook.");
+  }
+
+  function openGCal(ev){
+    const st=ev.time.split(" - ")[0];
+    function toGD(d,t){let[tp,ap]=t.split(" ");let[h,m]=tp.split(":").map(Number);if(ap==="PM"&&h!==12)h+=12;if(ap==="AM"&&h===12)h=0;return `${d.getFullYear()}${pad2(d.getMonth()+1)}${pad2(d.getDate())}T${pad2(h)}${pad2(m)}00`;}
+    let ed=new Date(ev.date),et;
+    if(ev.shift==="sat_night"||ev.shift==="sun_night"){ed.setDate(ed.getDate()+1);et="8:00 AM";}else et="5:00 PM";
+    const url=`https://calendar.google.com/calendar/render?action=TEMPLATE&text=${encodeURIComponent("On-Call: "+ev.label+" - Dr. "+ev.physician)}&dates=${toGD(ev.date,st)}/${toGD(ed,et)}&details=${encodeURIComponent("Dr. "+ev.physician+" | "+ev.time)}&location=Corvallis,OR`;
+    window.open(url,"_blank");
+  }
+  const calPhEvs=useMemo(()=>{const n=phys.find(p=>p.id==calPh)?.name;return evs.filter(e=>e.physician===n);},[calPh,evs,phys]);
+
+  const exportGroups=[
+    {title:"Microsoft / Cross-platform",items:[
+      {label:"Excel (.xlsx)",desc:"Full schedule + per-physician sheets + monthly summary. Opens in Excel, LibreOffice, Google Sheets.",color:COLORS[1],fn:()=>exportExcel(sched,phys,year)},
+      {label:"Word (.doc)",desc:"Monthly layout + individual physician sections. Opens in Word, LibreOffice, Google Docs.",color:COLORS[0],fn:()=>exportWord(sched,phys,year)},
+    ]},
+    {title:"Google Workspace",items:[
+      {label:"Google Sheets (.csv)",desc:"Import via File → Import in Google Sheets. Preserves all columns and data.",color:"#0f9d58",fn:()=>exportGoogleSheets(sched,phys,year)},
+      {label:"Google Docs (.html)",desc:"Download then open in Google Docs (File → Open). Formatted with month headers and tables.",color:"#4285f4",fn:()=>exportGoogleDocs(sched,phys,year)},
+    ]},
+    {title:"Apple",items:[
+      {label:"Numbers (.csv)",desc:"Import via File → Import in Numbers. Works on Mac and iPhone/iPad.",color:"#1c7f3e",fn:()=>exportNumbers(sched,phys,year)},
+      {label:"Pages (.rtf)",desc:"Open directly in Pages on Mac or iPad. Formatted document with monthly sections.",color:"#f08c00",fn:()=>exportPages(sched,phys,year)},
+    ]},
+  ];
+
+  return <div style={{display:"flex",flexDirection:"column",gap:18}}>
+    {exportGroups.map(group=>(
+      <div key={group.title}>
+        <div style={{fontSize:13,fontWeight:700,color:"#6b7280",marginBottom:8,textTransform:"uppercase",letterSpacing:"0.05em"}}>{group.title}</div>
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12}}>
+          {group.items.map(item=>(
+            <Card key={item.label} style={{padding:"12px 14px"}}>
+              <div style={{fontSize:14,fontWeight:700,marginBottom:4}}>{item.label}</div>
+              <div style={{fontSize:12,color:"#6b7280",marginBottom:12,lineHeight:1.5}}>{item.desc}</div>
+              <Btn onClick={()=>doExport(item.fn,item.label,item.label)} color={item.color} style={{width:"100%"}}>Download {item.label}</Btn>
+            </Card>
+          ))}
+        </div>
+      </div>
+    ))}
+
+    <div>
+      <div style={{fontSize:13,fontWeight:700,color:"#6b7280",marginBottom:8,textTransform:"uppercase",letterSpacing:"0.05em"}}>Digital Calendar Sync</div>
+      <Card>
+        <div style={{fontSize:14,fontWeight:700,marginBottom:4}}>Export to iCal (.ics)</div>
+        <div style={{fontSize:12,color:"#6b7280",marginBottom:12}}>Works with Google Calendar, Apple Calendar, and Outlook. Re-export after confirmed swaps — calendar apps update existing events by ID, no duplicates.</div>
+        <div style={{display:"flex",gap:10,alignItems:"flex-end",flexWrap:"wrap",marginBottom:12}}>
+          <div><label style={{fontSize:12,color:"#6b7280",display:"block",marginBottom:4,fontWeight:600}}>Export for:</label>
+            <select value={icalPh} onChange={e=>setIP(e.target.value)} style={{minWidth:210}}>
+              <option value="all">All physicians (full group)</option>
+              {phys.map(p=><option key={p.id} value={p.id}>{p.name} only</option>)}
+            </select></div>
+          <Btn onClick={doICS} color="#4c1d95">Download .ics File</Btn>
+        </div>
+        <div style={{fontSize:12,color:"#6b7280",background:"#f9fafb",borderRadius:8,padding:"10px 14px",lineHeight:2}}>
+          <strong>Google Calendar:</strong> Settings → Import &amp; Export → Import<br/>
+          <strong>Apple Calendar:</strong> File → Import<br/>
+          <strong>Outlook:</strong> File → Open &amp; Export → Import iCalendar<br/>
+          <strong>After a swap:</strong> Re-export and re-import to update calendars automatically.
+        </div>
+      </Card>
+    </div>
+
+    <div>
+      <div style={{fontSize:13,fontWeight:700,color:"#6b7280",marginBottom:8,textTransform:"uppercase",letterSpacing:"0.05em"}}>Add Individual Shifts to Google Calendar</div>
+      <Card>
+        <div style={{fontSize:12,color:"#6b7280",marginBottom:12}}>Click any shift row to open a pre-filled Google Calendar event in your browser.</div>
+        <div style={{display:"flex",gap:10,alignItems:"center",marginBottom:12}}>
+          <label style={{fontSize:13,fontWeight:600}}>Shifts for Dr.:</label>
+          <select value={calPh} onChange={e=>setCP(parseInt(e.target.value))}>
+            {phys.map(p=><option key={p.id} value={p.id}>{p.name}</option>)}
+          </select>
+        </div>
+        <div style={{maxHeight:280,overflowY:"auto",display:"flex",flexDirection:"column",gap:4}}>
+          {calPhEvs.length===0
+            ?<div style={{color:"#9ca3af",fontSize:13,padding:10}}>No shifts yet — generate the schedule first.</div>
+            :calPhEvs.map((ev,i)=>(
+              <div key={i} onClick={()=>openGCal(ev)}
+                style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"9px 12px",background:ev.type==="holiday"?"#fffbeb":"#f0f9ff",borderRadius:8,border:"1px solid #e5e7eb",cursor:"pointer",gap:8}}
+                onMouseEnter={e=>e.currentTarget.style.background=ev.type==="holiday"?"#fef3c7":"#dbeafe"}
+                onMouseLeave={e=>e.currentTarget.style.background=ev.type==="holiday"?"#fffbeb":"#f0f9ff"}>
+                <div style={{display:"flex",gap:10,alignItems:"center",flexWrap:"wrap"}}>
+                  <span style={{fontSize:13,fontWeight:700,color:"#374151"}}>{ev.date.toLocaleDateString("en-US",{month:"short",day:"numeric",weekday:"short"})}</span>
+                  <span style={{fontSize:12,color:"#4b5563"}}>{ev.label}</span>
+                  <span style={{fontSize:11,color:"#9ca3af"}}>{ev.time}</span>
+                  {ev.type==="holiday"&&<span style={{fontSize:11,background:"#fef3c7",color:"#92400e",borderRadius:20,padding:"1px 8px",fontWeight:700}}>Holiday</span>}
+                </div>
+                <span style={{fontSize:12,color:COLORS[0],fontWeight:700,whiteSpace:"nowrap"}}>+ Add to Google →</span>
+              </div>
+            ))
+          }
+        </div>
+      </Card>
+    </div>
+
+    {msg&&<div style={{fontSize:13,padding:"12px 16px",background:"#d1fae5",color:"#065f46",borderRadius:8,fontWeight:600,border:"1px solid #6ee7b7"}}>{msg}</div>}
+  </div>;
+}
+
+// ── PROFILES TAB ───────────────────────────────────────────────────────────
+function ProfilesTab({profiles,setProfiles,year,phys,setPhys}){
+  const [sel,setSel]=useState(phys[0]?.id||1),[edit,setEdit]=useState(false),[draft,setDraft]=useState({});
+  const [showAdd,setShowAdd]=useState(false),[newName,setNewName]=useState(""),[addMsg,setAddMsg]=useState("");
+  const hwList=useMemo(()=>getHolidayWeekends(year),[year]);
+  const regList=useMemo(()=>getRegularWeekends(year,hwList),[year,hwList]);
+  const allPick=useMemo(()=>{
+    const it=[];
+    regList.forEach(({sat,sun})=>it.push({key:dk(sat),label:`Weekend: ${fmt(sat)} – ${fmt(sun)}`}));
+    hwList.forEach(h=>it.push({key:dk(h.sat),label:`Holiday: ${h.label} (${fmt(h.sat)})`}));
+    return it;
+  },[year]);
+  const p=phys.find(x=>x.id===sel),pi=phys.findIndex(x=>x.id===sel),prof=profiles[sel]||{};
+  function startEdit(){setDraft({phone:prof.phone||"",email:prof.email||"",optimalShifts:prof.optimalShifts||20,consecutiveOk:prof.consecutiveOk!==false,blockedDates:prof.blockedDates||[]});setEdit(true);}
+  function savePro(){const u={...profiles,[sel]:{...prof,...draft}};setProfiles(u);lsSave("profiles",u);setEdit(false);}
+  function toggleBlk(key){const arr=draft.blockedDates||[];setDraft(d=>({...d,blockedDates:arr.includes(key)?arr.filter(x=>x!==key):[...arr,key]}));}
+  function addPh(){
+    if(!newName.trim()){setAddMsg("Please enter a full name.");return;}
+    if(phys.find(p=>p.name.toLowerCase()===newName.trim().toLowerCase())){setAddMsg("That name already exists.");return;}
+    const nid=Math.max(...phys.map(p=>p.id))+1;
+    const np={id:nid,name:newName.trim(),initials:getInitials(newName.trim())};
+    const up=[...phys,np];setPhys(up);lsSave("phys",up);setNewName("");setShowAdd(false);setAddMsg("");setSel(nid);
+  }
+  if(!p)return null;
+  return <div>
+    <div style={{display:"flex",gap:8,flexWrap:"wrap",marginBottom:16,alignItems:"center"}}>
+      {phys.map((ph,i)=>(
+        <button key={ph.id} onClick={()=>{setSel(ph.id);setEdit(false);}}
+          style={{display:"flex",alignItems:"center",gap:7,padding:"7px 14px",borderRadius:8,cursor:"pointer",border:sel===ph.id?`2px solid ${COLORS[i%COLORS.length]}`:"1px solid #e5e7eb",background:sel===ph.id?LIGHTS[i%LIGHTS.length]:"#fff",fontFamily:"inherit"}}>
+          <Av ini={ph.initials} size={24} ci={i}/>
+          <span style={{fontSize:12,fontWeight:700,color:COLORS[i%COLORS.length]}}>{ph.name.split(" ")[0]}</span>
+        </button>
+      ))}
+      <button onClick={()=>setShowAdd(s=>!s)} style={{padding:"7px 14px",borderRadius:8,cursor:"pointer",fontFamily:"inherit",border:"1px solid #d1d5db",background:showAdd?"#f3f4f6":"#fff",fontSize:12,color:"#374151",fontWeight:600}}>+ Add Physician</button>
+    </div>
+    {showAdd&&<Card style={{marginBottom:14}}>
+      <div style={{fontSize:14,fontWeight:700,marginBottom:10}}>Add New Physician to Call Group</div>
+      <div style={{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}}>
+        <input value={newName} onChange={e=>setNewName(e.target.value)} placeholder="Full name (e.g. Jane Smith)" style={{minWidth:230}} onKeyDown={e=>e.key==="Enter"&&addPh()}/>
+        <Btn onClick={addPh}>Add Physician</Btn>
+        <button onClick={()=>{setShowAdd(false);setAddMsg("");setNewName("");}} style={{padding:"8px 14px",border:"1px solid #d1d5db",background:"#fff",borderRadius:7,fontFamily:"inherit",fontSize:13}}>Cancel</button>
+      </div>
+      {addMsg&&<div style={{fontSize:12,color:"#dc2626",marginTop:8,fontWeight:600}}>{addMsg}</div>}
+    </Card>}
+    <Card>
+      <div style={{display:"flex",alignItems:"center",gap:14,marginBottom:18}}>
+        <Av ini={p.initials} size={50} ci={pi}/>
+        <div><div style={{fontSize:18,fontWeight:700}}>{p.name}</div><div style={{fontSize:12,color:"#6b7280"}}>Physician · Call Group</div></div>
+        {!edit&&<button onClick={startEdit} style={{marginLeft:"auto",padding:"7px 16px",borderRadius:7,border:"1px solid #d1d5db",background:"#fff",fontFamily:"inherit",fontSize:13,fontWeight:600}}>Edit Profile</button>}
+      </div>
+      {!edit
+        ?<div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
+          {[["Cell Phone",prof.phone||"—"],["Email",prof.email||"—"],["Optimal Weekends/Year",prof.optimalShifts||"Not set"],["Consecutive Weekends",prof.consecutiveOk!==false?"Allowed":"Prefer apart"],["Blocked Dates",(prof.blockedDates||[]).length+" blocked"]].map(([k,v])=>(
+            <div key={k} style={{padding:"10px 12px",background:"#f9fafb",borderRadius:8,border:"1px solid #f3f4f6"}}>
+              <div style={{fontSize:11,color:"#9ca3af",marginBottom:3,fontWeight:600}}>{k}</div>
+              <div style={{fontSize:13,fontWeight:700}}>{v}</div>
+            </div>
+          ))}
+        </div>
+        :<div style={{display:"flex",flexDirection:"column",gap:14}}>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12}}>
+            <div><label style={{fontSize:12,color:"#6b7280",display:"block",marginBottom:4,fontWeight:600}}>Cell Phone</label><input value={draft.phone} onChange={e=>setDraft(d=>({...d,phone:e.target.value}))} placeholder="(xxx) xxx-xxxx" style={{width:"100%"}}/></div>
+            <div><label style={{fontSize:12,color:"#6b7280",display:"block",marginBottom:4,fontWeight:600}}>Email</label><input value={draft.email} onChange={e=>setDraft(d=>({...d,email:e.target.value}))} placeholder="name@example.com" style={{width:"100%"}}/></div>
+          </div>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12}}>
+            <div><label style={{fontSize:12,color:"#6b7280",display:"block",marginBottom:4,fontWeight:600}}>Optimal Weekends Per Year</label><input type="number" min={1} max={60} value={draft.optimalShifts} onChange={e=>setDraft(d=>({...d,optimalShifts:parseInt(e.target.value)||20}))} style={{width:"100%"}}/></div>
+            <div><label style={{fontSize:12,color:"#6b7280",display:"block",marginBottom:4,fontWeight:600}}>Consecutive Weekends OK?</label><select value={draft.consecutiveOk?"yes":"no"} onChange={e=>setDraft(d=>({...d,consecutiveOk:e.target.value==="yes"}))} style={{width:"100%"}}><option value="yes">Yes — allowed</option><option value="no">No — prefer apart</option></select></div>
+          </div>
+          <div>
+            <div style={{fontSize:12,color:"#6b7280",marginBottom:6,fontWeight:600}}>Block weekends/holidays you cannot work</div>
+            <div style={{maxHeight:200,overflowY:"auto",border:"1px solid #e5e7eb",borderRadius:8,padding:8}}>
+              {allPick.map(it=>(
+                <label key={it.key} style={{display:"flex",alignItems:"center",gap:9,padding:"6px 4px",cursor:"pointer",fontSize:12,borderBottom:"1px solid #f3f4f6"}}>
+                  <input type="checkbox" checked={(draft.blockedDates||[]).includes(it.key)} onChange={()=>toggleBlk(it.key)}/>{it.label}
+                </label>
+              ))}
+            </div>
+          </div>
+          <div style={{display:"flex",gap:8}}>
+            <Btn onClick={savePro}>Save Profile</Btn>
+            <button onClick={()=>setEdit(false)} style={{padding:"9px 18px",border:"1px solid #d1d5db",background:"#fff",borderRadius:7,fontFamily:"inherit",fontSize:13,fontWeight:600}}>Cancel</button>
+          </div>
+        </div>
+      }
+    </Card>
+  </div>;
+}
+
+// ── SWAPS TAB ──────────────────────────────────────────────────────────────
+function SwapsTab({year,phys}){
+  const [swaps,setSwaps]=useState([]),[form,setForm]=useState({req:"",date:"",slot:"",with:"",reason:""}),[msg,setMsg]=useState("");
+  const OPTS=["Full Weekend Block","Holiday Weekend — Physician 1 (Sat Night)","Holiday Weekend — Physician 2 (Sun Night)","2-Physician Weekend — Position 1","2-Physician Weekend — Position 2"];
+  useEffect(()=>{setSwaps(lsLoad("swaps_"+year,[]));},[year]);
+  function submit(){
+    if(!form.req||!form.date||!form.slot){setMsg("Please fill all required fields.");return;}
+    const s={id:Date.now(),...form,status:"Pending",created:new Date().toLocaleDateString()};
+    const u=[...swaps,s];setSwaps(u);lsSave("swaps_"+year,u);
+    const rn=phys.find(p=>p.id==form.req)?.name||"",wn=phys.find(p=>p.id==form.with)?.name||"";
+    setMsg(`Submitted!\n\nGroup text preview:\nSWAP REQUEST — Dr. ${rn}\nWeekend of: ${form.date}\nSlot: ${form.slot}${wn?`\nRequesting swap with Dr. ${wn}`:""}${form.reason?`\nReason: ${form.reason}`:""}\n\nAfter approval, re-export .ics from Export & Sync tab to update all calendars.`);
+    setForm({req:"",date:"",slot:"",with:"",reason:""});
+  }
+  function upd(id,status){
+    const u=swaps.map(s=>s.id===id?{...s,status}:s);setSwaps(u);lsSave("swaps_"+year,u);
+    if(status==="Approved")setMsg("Swap approved! Go to Export & Sync to re-download the .ics file. Ben and Amanda would be notified.");
+  }
+  const sC={Pending:"#92400e",Approved:"#065f46",Declined:"#991b1b"};
+  const sB={Pending:"#fef3c7",Approved:"#d1fae5",Declined:"#fee2e2"};
+  return <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:16}}>
+    <Card>
+      <div style={{fontSize:15,fontWeight:700,marginBottom:14}}>Request a Swap</div>
+      <div style={{display:"flex",flexDirection:"column",gap:12}}>
+        <div><label style={{fontSize:12,color:"#6b7280",display:"block",marginBottom:4,fontWeight:600}}>Your Name *</label><select value={form.req} onChange={e=>setForm(f=>({...f,req:e.target.value}))} style={{width:"100%"}}><option value="">Select</option>{phys.map(p=><option key={p.id} value={p.id}>{p.name}</option>)}</select></div>
+        <div><label style={{fontSize:12,color:"#6b7280",display:"block",marginBottom:4,fontWeight:600}}>Weekend Date (Saturday) *</label><input type="date" value={form.date} onChange={e=>setForm(f=>({...f,date:e.target.value}))} style={{width:"100%"}}/></div>
+        <div><label style={{fontSize:12,color:"#6b7280",display:"block",marginBottom:4,fontWeight:600}}>Slot to Swap *</label><select value={form.slot} onChange={e=>setForm(f=>({...f,slot:e.target.value}))} style={{width:"100%"}}><option value="">Select</option>{OPTS.map(s=><option key={s} value={s}>{s}</option>)}</select></div>
+        <div><label style={{fontSize:12,color:"#6b7280",display:"block",marginBottom:4,fontWeight:600}}>Swap With (optional)</label><select value={form.with} onChange={e=>setForm(f=>({...f,with:e.target.value}))} style={{width:"100%"}}><option value="">Send to whole group</option>{phys.map(p=><option key={p.id} value={p.id}>{p.name}</option>)}</select></div>
+        <div><label style={{fontSize:12,color:"#6b7280",display:"block",marginBottom:4,fontWeight:600}}>Reason (optional)</label><input value={form.reason} onChange={e=>setForm(f=>({...f,reason:e.target.value}))} placeholder="e.g. Out of town, family event..." style={{width:"100%"}}/></div>
+        <Btn onClick={submit} style={{width:"100%"}}>Submit Swap Request</Btn>
+        {msg&&<div style={{fontSize:12,padding:"10px 12px",background:"#f9fafb",border:"1px solid #e5e7eb",borderRadius:8,whiteSpace:"pre-line",color:"#374151",lineHeight:1.7}}>{msg}</div>}
+      </div>
+    </Card>
+    <div>
+      <div style={{fontSize:15,fontWeight:700,marginBottom:12}}>Swap History</div>
+      {swaps.length===0?<div style={{color:"#9ca3af",fontSize:13}}>No swaps yet.</div>:
+        <div style={{display:"flex",flexDirection:"column",gap:8}}>
+          {swaps.slice().reverse().map(s=>(
+            <Card key={s.id} style={{padding:"10px 14px"}}>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start"}}>
+                <div><div style={{fontSize:13,fontWeight:700}}>Dr. {phys.find(p=>p.id==s.req)?.name}</div><div style={{fontSize:12,color:"#6b7280"}}>{s.date} · {s.slot}</div>{s.with&&<div style={{fontSize:11,color:"#9ca3af"}}>With Dr. {phys.find(p=>p.id==s.with)?.name}</div>}</div>
+                <span style={{background:sB[s.status],color:sC[s.status],fontSize:11,fontWeight:700,padding:"3px 10px",borderRadius:20}}>{s.status}</span>
+              </div>
+              {s.status==="Pending"&&<div style={{display:"flex",gap:6,marginTop:8}}>
+                <Btn onClick={()=>upd(s.id,"Approved")} color={COLORS[1]} style={{padding:"5px 14px",fontSize:12}}>Approve</Btn>
+                <Btn onClick={()=>upd(s.id,"Declined")} color="#dc2626" style={{padding:"5px 14px",fontSize:12}}>Decline</Btn>
+              </div>}
+              {s.status==="Approved"&&<div style={{fontSize:11,color:COLORS[1],marginTop:6,fontWeight:600}}>✓ Re-export .ics from Export & Sync to update calendars</div>}
+            </Card>
+          ))}
+        </div>
+      }
+    </div>
+  </div>;
+}
+
+// ── HOTEL TAB ──────────────────────────────────────────────────────────────
+function HotelTab({year,phys}){
+  const [log,setLog]=useState([]),[form,setForm]=useState({ph:"",date:"",action:"book",notes:""}),[msg,setMsg]=useState("");
+  useEffect(()=>{setLog(lsLoad("hotel_"+year,[]));},[year]);
+  function submit(){
+    if(!form.ph||!form.date){setMsg("Please select a physician and date.");return;}
+    const e={...form,id:Date.now(),ts:new Date().toLocaleString()};
+    const u=[...log,e];setLog(u);lsSave("hotel_"+year,u);
+    setMsg(`Logged! Call Comfort Suites Corvallis at 541-753-4320 to ${form.action} the reservation for Dr. ${phys.find(p=>p.id==form.ph)?.name} on ${form.date}.`);
+    setForm({ph:"",date:"",action:"book",notes:""});
+  }
+  return <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:16}}>
+    <Card>
+      <div style={{fontSize:15,fontWeight:700,marginBottom:4}}>Hotel Reservation Request</div>
+      <div style={{fontSize:12,color:"#6b7280",marginBottom:14}}>Comfort Suites Corvallis · 541-753-4320 · 1730 NW 9th St</div>
+      <div style={{display:"flex",flexDirection:"column",gap:12}}>
+        <div><label style={{fontSize:12,color:"#6b7280",display:"block",marginBottom:4,fontWeight:600}}>Physician</label><select value={form.ph} onChange={e=>setForm(f=>({...f,ph:e.target.value}))} style={{width:"100%"}}><option value="">Select</option>{phys.map(p=><option key={p.id} value={p.id}>{p.name}</option>)}</select></div>
+        <div><label style={{fontSize:12,color:"#6b7280",display:"block",marginBottom:4,fontWeight:600}}>Date of Stay</label><input type="date" value={form.date} onChange={e=>setForm(f=>({...f,date:e.target.value}))} style={{width:"100%"}}/></div>
+        <div><label style={{fontSize:12,color:"#6b7280",display:"block",marginBottom:4,fontWeight:600}}>Action</label><select value={form.action} onChange={e=>setForm(f=>({...f,action:e.target.value}))} style={{width:"100%"}}><option value="book">Book Reservation</option><option value="modify">Modify Reservation</option><option value="cancel">Cancel Reservation</option></select></div>
+        <div><label style={{fontSize:12,color:"#6b7280",display:"block",marginBottom:4,fontWeight:600}}>Notes</label><input value={form.notes} onChange={e=>setForm(f=>({...f,notes:e.target.value}))} placeholder="Confirmation #, special requests..." style={{width:"100%"}}/></div>
+        <Btn onClick={submit} style={{width:"100%"}}>Submit Hotel Request</Btn>
+        {msg&&<div style={{fontSize:12,padding:"10px 12px",background:"#f0fdf4",border:"1px solid #86efac",borderRadius:8,color:"#14532d"}}>{msg}</div>}
+      </div>
+    </Card>
+    <div>
+      <div style={{fontSize:15,fontWeight:700,marginBottom:12}}>Hotel Request Log</div>
+      {log.length===0?<div style={{color:"#9ca3af",fontSize:13}}>No hotel requests logged yet.</div>:
+        <div style={{display:"flex",flexDirection:"column",gap:8}}>
+          {log.slice().reverse().map(e=>(
+            <Card key={e.id} style={{padding:"10px 14px"}}>
+              <div style={{fontSize:13,fontWeight:700}}>Dr. {phys.find(p=>p.id==e.ph)?.name}</div>
+              <div style={{fontSize:12,color:"#6b7280"}}>{e.date} · {e.action}</div>
+              {e.notes&&<div style={{fontSize:11,color:"#9ca3af",marginTop:2}}>{e.notes}</div>}
+              <div style={{fontSize:10,color:"#d1d5db",marginTop:3}}>{e.ts}</div>
+            </Card>
+          ))}
+        </div>
+      }
+    </div>
+  </div>;
+}
+
+// ── REPORTS TAB ────────────────────────────────────────────────────────────
+function ReportsTab({sched,year,phys}){
+  const [q,setQ]=useState("Q1");
+  const qM={Q1:[0,1,2],Q2:[3,4,5],Q3:[6,7,8],Q4:[9,10,11]};
+  const stats=useMemo(()=>{
+    const d={};phys.forEach(p=>{d[p.id]={reg:0,hol:0,total:0};});
+    const months=qM[q];
+    Object.entries(sched).forEach(([satK,slot])=>{
+      const dt=new Date(satK);if(!months.includes(dt.getMonth()))return;
+      if(slot.type==="regular"){
+        if(slot.physicianId&&d[slot.physicianId]){d[slot.physicianId].reg++;d[slot.physicianId].total++;}
+        if(slot.twoPhysicians&&slot.physician2Id&&d[slot.physician2Id]){d[slot.physician2Id].reg++;d[slot.physician2Id].total++;}
+      }
+      if(slot.type==="holiday"){
+        if(slot.physician1Id&&d[slot.physician1Id]){d[slot.physician1Id].hol++;d[slot.physician1Id].total++;}
+        if(slot.physician2Id&&d[slot.physician2Id]){d[slot.physician2Id].hol++;d[slot.physician2Id].total++;}
+      }
+    });
+    return d;
+  },[sched,q,phys]);
+  return <div>
+    <div style={{display:"flex",gap:8,marginBottom:18,alignItems:"center"}}>
+      {["Q1","Q2","Q3","Q4"].map(qq=>(
+        <button key={qq} onClick={()=>setQ(qq)} style={{padding:"8px 22px",borderRadius:8,cursor:"pointer",fontFamily:"inherit",border:q===qq?`2px solid ${COLORS[0]}`:"1px solid #e5e7eb",background:q===qq?LIGHTS[0]:"#fff",color:q===qq?COLORS[0]:"#374151",fontSize:13,fontWeight:q===qq?700:400}}>{qq}</button>
+      ))}
+      <span style={{fontSize:12,color:"#9ca3af",marginLeft:8}}>{q==="Q1"?"Jan–Mar":q==="Q2"?"Apr–Jun":q==="Q3"?"Jul–Sep":"Oct–Dec"} {year}</span>
+    </div>
+    <div style={{overflowX:"auto"}}>
+      <table style={{width:"100%",borderCollapse:"collapse",fontSize:13}}>
+        <thead><tr style={{borderBottom:"2px solid #e5e7eb",background:"#f9fafb"}}>{["Physician","Regular Weekends","Holiday Weekends","Total Weekends"].map(h=><th key={h} style={{padding:"10px 14px",textAlign:"left",fontWeight:700,color:"#6b7280",fontSize:12}}>{h}</th>)}</tr></thead>
+        <tbody>
+          {phys.map((p,i)=>{
+            const s=stats[p.id]||{reg:0,hol:0,total:0};
+            return <tr key={p.id} style={{borderBottom:"1px solid #f3f4f6"}}>
+              <td style={{padding:"11px 14px"}}><div style={{display:"flex",alignItems:"center",gap:10}}><Av ini={p.initials} size={28} ci={i}/><span style={{fontWeight:700,fontSize:14}}>{p.name}</span></div></td>
+              <td style={{padding:"11px 14px",fontSize:15,fontWeight:600}}>{s.reg}</td>
+              <td style={{padding:"11px 14px",fontSize:15,fontWeight:600}}>{s.hol}</td>
+              <td style={{padding:"11px 14px",fontSize:15,fontWeight:800,color:COLORS[0]}}>{s.total}</td>
+            </tr>;
+          })}
+        </tbody>
+      </table>
+    </div>
+    <div style={{marginTop:20}}>
+      <Card>
+        <div style={{fontSize:13,color:"#6b7280",marginBottom:10}}>Send {q} {year} report to unit managers Ben and Amanda</div>
+        <Btn onClick={()=>alert(`${q} ${year} Quarterly Report\n\nWould be sent to:\n• Ben (Unit Manager)\n• Amanda (Unit Manager)\n\nVia text and email with full shift counts and swap activity.`)}>Send Report to Ben & Amanda</Btn>
+      </Card>
+    </div>
+  </div>;
+}
+
+// ── MAIN APP ───────────────────────────────────────────────────────────────
+function App(){
+  const cy=new Date().getFullYear();
+  const [year,setYear]=useState(cy),[tab,setTab]=useState("schedule");
+  const [phys,setPhys]=useState(()=>lsLoad("phys",DEFAULT_PHYSICIANS));
+  const [profiles,setProfiles]=useState(()=>lsLoad("profiles",{}));
+  const [sched,setSched]=useState(()=>lsLoad("sched_"+cy,{}));
+
+  useEffect(()=>{setSched(lsLoad("sched_"+year,{}));},[year]);
+
+  const TABS=[
+    {id:"schedule",label:"Schedule"},
+    {id:"calendar",label:"Calendar"},
+    {id:"export",label:"Export & Sync"},
+    {id:"profiles",label:"Profiles"},
+    {id:"swaps",label:"Swaps"},
+    {id:"hotel",label:"Hotel"},
+    {id:"reports",label:"Reports"},
+  ];
+
+  return <div style={{minHeight:"100vh",background:"#f3f4f6"}}>
+    <div style={{background:"#1d4ed8",padding:"14px 24px",display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:10,boxShadow:"0 2px 8px rgba(0,0,0,.15)"}}>
+      <div style={{display:"flex",alignItems:"center",gap:12}}>
+        <div style={{fontSize:26}}>📋</div>
+        <div><div style={{fontSize:18,fontWeight:800,color:"#fff"}}>On-Call Scheduler</div><div style={{fontSize:11,color:"#bfdbfe"}}>Physician Call Group · Corvallis, OR</div></div>
+      </div>
+      <div style={{display:"flex",alignItems:"center",gap:12}}>
+        <span style={{fontSize:13,color:"#bfdbfe",fontWeight:600}}>Year:</span>
+        <select value={year} onChange={e=>setYear(parseInt(e.target.value))} style={{fontSize:13,padding:"5px 10px",borderRadius:6,border:"none",fontWeight:600}}>
+          {[cy-1,cy,cy+1,cy+2].map(y=><option key={y} value={y}>{y}</option>)}
+        </select>
+        <div style={{display:"flex",gap:4}}>{phys.map((p,i)=><div key={p.id} title={p.name}><Av ini={p.initials} size={28} ci={i}/></div>)}</div>
+      </div>
+    </div>
+    <div className="no-print" style={{background:"#fff",borderBottom:"1px solid #e5e7eb",padding:"0 24px",display:"flex",gap:0,overflowX:"auto"}}>
+      {TABS.map(t=>(
+        <button key={t.id} onClick={()=>setTab(t.id)} style={{padding:"13px 18px",border:"none",background:"none",cursor:"pointer",fontFamily:"inherit",fontSize:13,fontWeight:tab===t.id?700:500,color:tab===t.id?COLORS[0]:"#6b7280",borderBottom:tab===t.id?`3px solid ${COLORS[0]}`:"3px solid transparent",whiteSpace:"nowrap"}}>
+          {t.label}
+        </button>
+      ))}
+    </div>
+    <div style={{maxWidth:980,margin:"0 auto",padding:"24px 20px"}}>
+      {tab==="schedule"&&<ScheduleTab year={year} sched={sched} setSched={setSched} profiles={profiles} phys={phys}/>}
+      {tab==="calendar"&&<CalendarTab sched={sched} phys={phys} year={year}/>}
+      {tab==="export"&&<ExportTab sched={sched} phys={phys} year={year}/>}
+      {tab==="profiles"&&<ProfilesTab profiles={profiles} setProfiles={setProfiles} year={year} phys={phys} setPhys={setPhys}/>}
+      {tab==="swaps"&&<SwapsTab year={year} phys={phys}/>}
+      {tab==="hotel"&&<HotelTab year={year} phys={phys}/>}
+      {tab==="reports"&&<ReportsTab sched={sched} year={year} phys={phys}/>}
+    </div>
+  </div>;
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App/>);
+</script>
+</body>
+</html>
